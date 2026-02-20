@@ -15,6 +15,8 @@
 const express = require("express");
 const fetch = require("node-fetch");
 const dns = require("dns").promises;
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 4782;
@@ -34,6 +36,25 @@ const headers = {
   Authorization: "Basic " + Buffer.from(`${user}:${pass}`).toString("base64"),
   "Content-Type": "application/json",
 };
+
+// ── Confirmed domains persistence ────────────────────────────
+const CONFIRMED_FILE = path.join(__dirname, "confirmed.json");
+
+function loadConfirmed() {
+  try {
+    if (fs.existsSync(CONFIRMED_FILE)) {
+      return JSON.parse(fs.readFileSync(CONFIRMED_FILE, "utf8"));
+    }
+  } catch {}
+  return {};
+}
+
+function saveConfirmed(data) {
+  fs.writeFileSync(CONFIRMED_FILE, JSON.stringify(data, null, 2));
+}
+
+// Key = domain name, value = { confirmedAt, note }
+let confirmedDomains = loadConfirmed();
 
 // ── Cached data ──────────────────────────────────────────────
 let cachedData = null;
@@ -229,18 +250,68 @@ async function refreshData() {
 
 // ── Routes ───────────────────────────────────────────────────
 
+function applyConfirmedOverrides(data) {
+  if (!data || !data.sites) return data;
+  let confirmedCount = 0;
+  const sites = data.sites.map(site => {
+    const domains = site.domains.map(d => {
+      if (d.status === "issue" && confirmedDomains[d.name]) {
+        confirmedCount++;
+        return { ...d, status: "confirmed", originalStatus: "issue", originalDetail: d.detail, detail: "Confirmed OK", confirmedAt: confirmedDomains[d.name].confirmedAt };
+      }
+      return d;
+    });
+    const custom = domains.filter(d => !d.isSystem);
+    return {
+      ...site, domains,
+      issueCount: custom.filter(d => d.status === "issue").length,
+      confirmedCount: custom.filter(d => d.status === "confirmed").length,
+    };
+  });
+  const allDomains = sites.flatMap(s => s.domains);
+  const customDomains = allDomains.filter(d => !d.isSystem);
+  return {
+    sites,
+    stats: {
+      ...data.stats,
+      good: customDomains.filter(d => d.status === "good").length,
+      issues: customDomains.filter(d => d.status === "issue").length,
+      confirmed: customDomains.filter(d => d.status === "confirmed").length,
+      pending: customDomains.filter(d => d.status === "pending").length,
+    },
+  };
+}
+
+app.use(express.json());
+
 app.get("/api/data", (req, res) => {
-  if (cachedData) return res.json(cachedData);
+  if (cachedData) return res.json(applyConfirmedOverrides(cachedData));
   res.json({ sites: [], stats: null });
 });
 
 app.get("/api/refresh", async (req, res) => {
   try {
     const data = await refreshData();
-    res.json(data);
+    res.json(applyConfirmedOverrides(data));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+app.post("/api/confirm", (req, res) => {
+  const { domain } = req.body;
+  if (!domain) return res.status(400).json({ error: "domain is required" });
+  confirmedDomains[domain] = { confirmedAt: new Date().toISOString() };
+  saveConfirmed(confirmedDomains);
+  res.json({ ok: true, domain, confirmed: true });
+});
+
+app.delete("/api/confirm", (req, res) => {
+  const { domain } = req.body;
+  if (!domain) return res.status(400).json({ error: "domain is required" });
+  delete confirmedDomains[domain];
+  saveConfirmed(confirmedDomains);
+  res.json({ ok: true, domain, confirmed: false });
 });
 
 app.get("/api/status", (req, res) => {
@@ -289,7 +360,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: #6b7280; margin-bottom: 4px; }
   .stat-value { font-size: 28px; font-weight: 700; }
   .c-white { color: #e5e7eb; } .c-blue { color: #60a5fa; } .c-indigo { color: #818cf8; }
-  .c-green { color: #34d399; } .c-red { color: #f87171; } .c-amber { color: #fbbf24; }
+  .c-green { color: #34d399; } .c-red { color: #f87171; } .c-amber { color: #fbbf24; } .c-teal { color: #2dd4bf; }
 
   .site-card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; margin-bottom: 10px; overflow: hidden; }
   .site-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; cursor: pointer; transition: background .15s; user-select: none; }
@@ -317,8 +388,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .system-name { color: #6b7280; }
   .redirect { color: #4b5563; font-size: 11px; }
   .resolves-to { color: #6b7280; font-size: 11px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .verdict { font-weight: 700; font-size: 13px; }
-  .v-good { color: #34d399; } .v-issue { color: #f87171; } .v-pending { color: #fbbf24; } .v-na { color: #4b5563; }
+  .verdict { font-weight: 700; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .v-good { color: #34d399; } .v-issue { color: #f87171; } .v-pending { color: #fbbf24; } .v-na { color: #4b5563; } .v-confirmed { color: #2dd4bf; }
+  .b-teal { background: rgba(13,148,136,.3); color: #5eead4; border-color: #0d9488; }
+  .confirm-btn { padding: 2px 8px; border-radius: 6px; font-size: 10px; font-weight: 600; cursor: pointer; border: 1px solid; transition: all .15s; }
+  .confirm-btn.mark { background: rgba(13,148,136,.2); color: #5eead4; border-color: #0d9488; }
+  .confirm-btn.mark:hover { background: rgba(13,148,136,.4); }
+  .confirm-btn.unmark { background: rgba(127,29,29,.2); color: #fca5a5; border-color: #7f1d1d; }
+  .confirm-btn.unmark:hover { background: rgba(127,29,29,.4); }
 
   .count-info { font-size: 11px; color: #6b7280; margin-bottom: 12px; }
   .no-match { text-align: center; padding: 48px; color: #4b5563; }
@@ -344,6 +421,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="filter-group">
         <button class="filter-btn active" data-filter="all">All</button>
         <button class="filter-btn" data-filter="issues">Issues</button>
+        <button class="filter-btn" data-filter="confirmed">Confirmed</button>
         <button class="filter-btn" data-filter="good">Good</button>
       </div>
       <button class="refresh-btn" id="refreshBtn" onclick="doRefresh()">
@@ -382,6 +460,7 @@ function renderStats() {
     '<div class="stat"><div class="stat-label">Custom Domains</div><div class="stat-value c-indigo">'+s.customDomains+'</div></div>' +
     '<div class="stat"><div class="stat-label">Good</div><div class="stat-value c-green">'+s.good+'</div></div>' +
     '<div class="stat"><div class="stat-label">Issues</div><div class="stat-value '+(s.issues>0?'c-red':'c-green')+'">'+s.issues+'</div></div>' +
+    '<div class="stat"><div class="stat-label">Confirmed</div><div class="stat-value c-teal">'+(s.confirmed||0)+'</div></div>' +
     '<div class="stat"><div class="stat-label">Pending</div><div class="stat-value c-amber">'+s.pending+'</div></div>';
   document.getElementById("timestamp").textContent = "Updated " + new Date(s.timestamp).toLocaleString();
 }
@@ -398,15 +477,16 @@ function renderSites() {
     }
     if (currentFilter === "all") return true;
     if (currentFilter === "issues") return site.issueCount > 0;
-    return site.issueCount === 0;
+    if (currentFilter === "confirmed") return (site.confirmedCount || 0) > 0;
+    return site.issueCount === 0 && (site.confirmedCount || 0) === 0;
   });
 
   document.getElementById("countInfo").textContent = "Showing " + filtered.length + " of " + DATA.length + " sites";
   document.getElementById("noMatch").classList.toggle("hidden", filtered.length > 0);
 
   el.innerHTML = filtered.map(site => {
-    const dotCls = site.issueCount > 0 ? "dot-red" : site.domains.filter(d=>!d.isSystem&&d.status==="good").length === site.domains.filter(d=>!d.isSystem).length && site.domains.filter(d=>!d.isSystem).length > 0 ? "dot-green" : "dot-gray";
-    const autoOpen = currentFilter === "issues" && site.issueCount > 0;
+    const dotCls = site.issueCount > 0 ? "dot-red" : (site.confirmedCount||0) > 0 ? "dot-amber" : site.domains.filter(d=>!d.isSystem&&(d.status==="good"||d.status==="confirmed")).length === site.domains.filter(d=>!d.isSystem).length && site.domains.filter(d=>!d.isSystem).length > 0 ? "dot-green" : "dot-gray";
+    const autoOpen = (currentFilter === "issues" && site.issueCount > 0) || (currentFilter === "confirmed" && (site.confirmedCount||0) > 0);
 
     return '<div class="site-card">' +
       '<div class="site-header">' +
@@ -417,21 +497,23 @@ function renderSites() {
           (site.primary_domain ? '<span class="primary-domain">' + esc(site.primary_domain) + '</span>' : '') +
           '<span class="badge b-gray">' + site.domains.length + ' domains</span>' +
           (site.issueCount > 0 ? '<span class="badge b-red">' + site.issueCount + ' issue' + (site.issueCount!==1?'s':'') + '</span>' : '') +
+          ((site.confirmedCount||0) > 0 ? '<span class="badge b-teal">' + site.confirmedCount + ' confirmed</span>' : '') +
           (site.pendingCount > 0 ? '<span class="badge b-amber">' + site.pendingCount + ' pending</span>' : '') +
-          (site.issueCount === 0 && site.pendingCount === 0 && site.domains.filter(d=>!d.isSystem).length > 0 ? '<span class="badge b-green">All good</span>' : '') +
+          (site.issueCount === 0 && (site.confirmedCount||0) === 0 && site.pendingCount === 0 && site.domains.filter(d=>!d.isSystem).length > 0 ? '<span class="badge b-green">All good</span>' : '') +
         '</div>' +
         '<svg class="chevron' + (autoOpen ? ' open' : '') + '" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>' +
       '</div>' +
       '<table class="domain-table" style="display:' + (autoOpen ? 'table' : 'none') + '">' +
-        '<thead><tr><th>Domain</th><th>Network</th><th>DNS Status</th><th>Resolves To</th><th>SSL</th><th>Verdict</th></tr></thead>' +
+        '<thead><tr><th>Domain</th><th>Network</th><th>DNS Status</th><th>Resolves To</th><th>SSL</th><th>Verdict</th><th></th></tr></thead>' +
         '<tbody>' + site.domains.map(d => {
-          const dotColor = d.status==="good"?"#34d399":d.status==="issue"?"#f87171":d.status==="pending"?"#fbbf24":"#4b5563";
+          const dotColor = d.status==="good"?"#34d399":d.status==="issue"?"#f87171":d.status==="confirmed"?"#2dd4bf":d.status==="pending"?"#fbbf24":"#4b5563";
           const resolvesTo = d.dns ? (d.dns.cnames.length > 0 ? d.dns.cnames.join(", ") : d.dns.ips.length > 0 ? d.dns.ips.join(", ") : "\\u2014") : "\\u2014";
-          const statusBadge = d.status==="good"?'b-green':d.status==="issue"?'b-red':d.status==="pending"?'b-amber':'b-gray';
-          const verdictCls = d.status==="good"?"v-good":d.status==="issue"?"v-issue":d.status==="pending"?"v-pending":"v-na";
-          const verdictText = d.status==="good"?"GOOD":d.status==="issue"?"ISSUE":d.status==="pending"?"PENDING":d.status==="system"?"\\u2014":"?";
+          const statusBadge = d.status==="good"?'b-green':d.status==="issue"?'b-red':d.status==="confirmed"?'b-teal':d.status==="pending"?'b-amber':'b-gray';
+          const verdictCls = d.status==="good"?"v-good":d.status==="issue"?"v-issue":d.status==="confirmed"?"v-confirmed":d.status==="pending"?"v-pending":"v-na";
+          const verdictText = d.status==="good"?"GOOD":d.status==="issue"?"ISSUE":d.status==="confirmed"?"CONFIRMED":d.status==="pending"?"PENDING":d.status==="system"?"\\u2014":"?";
           const netBadge = d.network_type==="AN"?"b-blue":d.network_type==="GES"?"b-green":"b-gray";
           const sslBadge = d.sslStatus==="active"?"b-green":d.sslStatus==="expired"?"b-red":d.sslStatus==="pending_validation"?"b-amber":"b-gray";
+          const confirmBtn = d.status==="issue" ? '<button class="confirm-btn mark" data-domain="' + esc(d.name) + '" data-action="confirm">Confirm OK</button>' : d.status==="confirmed" ? '<button class="confirm-btn unmark" data-domain="' + esc(d.name) + '" data-action="unconfirm">Unconfirm</button>' : '';
 
           return '<tr>' +
             '<td><div class="domain-name"><div class="d-dot" style="background:'+dotColor+'"></div>' +
@@ -441,10 +523,11 @@ function renderSites() {
               (d.redirect_to ? ' <span class="redirect">\\u2192 ' + esc(d.redirect_to) + '</span>' : '') +
             '</div></td>' +
             '<td><span class="badge '+netBadge+'">' + esc(d.network_type||"\\u2014") + '</span></td>' +
-            '<td><span class="badge '+statusBadge+'">' + esc(d.detail) + '</span></td>' +
+            '<td><span class="badge '+statusBadge+'">' + esc(d.status==="confirmed"?(d.originalDetail||d.detail):d.detail) + '</span></td>' +
             '<td><span class="resolves-to">' + esc(resolvesTo) + '</span></td>' +
             '<td><span class="badge '+sslBadge+'">' + esc(d.sslStatus||"\\u2014") + '</span></td>' +
             '<td><span class="verdict '+verdictCls+'">' + verdictText + '</span></td>' +
+            '<td>' + confirmBtn + '</td>' +
           '</tr>';
         }).join("") + '</tbody>' +
       '</table>' +
@@ -460,6 +543,15 @@ function renderSites() {
         table.style.display = show ? "table" : "none";
         chev.classList.toggle("open", show);
       }
+    });
+  });
+
+  el.querySelectorAll(".confirm-btn").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const domain = btn.dataset.domain;
+      const action = btn.dataset.action;
+      toggleConfirm(domain, action === "confirm");
     });
   });
 }
@@ -503,6 +595,19 @@ async function doRefresh() {
     btn.querySelector("svg").style.display = "";
     document.getElementById("loadingScreen").classList.add("hidden");
   }
+}
+
+async function toggleConfirm(domain, confirm) {
+  try {
+    const method = confirm ? "POST" : "DELETE";
+    const res = await fetch("/api/confirm", { method, headers: {"Content-Type":"application/json"}, body: JSON.stringify({domain}) });
+    const result = await res.json();
+    if (!result.ok) throw new Error("Failed");
+    // Re-fetch data to get updated statuses
+    const dataRes = await fetch("/api/data");
+    const data = await dataRes.json();
+    if (data.sites) { DATA = data.sites; STATS = data.stats; renderStats(); renderSites(); }
+  } catch(e) { alert("Failed to update: " + e.message); }
 }
 
 // Filters
